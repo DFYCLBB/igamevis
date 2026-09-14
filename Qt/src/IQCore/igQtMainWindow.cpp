@@ -6689,6 +6689,18 @@ void igQtMainWindow::initAllMySignalConnections() {
         rendererWidget->update();
     });
 
+    // —— 统计单元顶点数：结果作为独立节点加入模型树，可按 cell_vertex_count 着色 ——
+    connect(ui->widget_CountCellVertices, &igQtCountCellVerticesWidget::DrawCountModel, this,
+            [&](iGame::DataObject::Pointer res) {
+                modelTreeWidget->addDataObjectToModelTree(res, ItemSource::Algorithm);
+            });
+    connect(ui->widget_CountCellVertices, &igQtCountCellVerticesWidget::UpdateCountModel, this,
+            [&](DataObject::Pointer res) {
+                modelTreeWidget->updateCurrentModelInfo();
+                modelTreeWidget->updateAllAttriubute(res);
+                rendererWidget->update();
+            });
+
     connect(fileLoader, &igQtFileLoader::FinishReading, this, [&]() {
         auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
         if (!scene) return;

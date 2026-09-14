@@ -18,7 +18,7 @@ igQtCountCellVerticesWidget::igQtCountCellVerticesWidget(QWidget* parent)
     connect(ui->btnExecute, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::ExecuteCount);
     connect(ui->btnExportCSV, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::ExportCSV);
 
-    // 表格初始化：两列表头 + 可排序 + 拉伸
+    // 表格初始化：两列表头 + 拉伸
     QStringList headers;
     headers << QStringLiteral("单元编号") << QStringLiteral("顶点数");
     ui->tableWidget->setHorizontalHeaderLabels(headers);
@@ -52,11 +52,13 @@ igQtCountCellVerticesWidget::igQtCountCellVerticesWidget(QWidget* parent)
 
 void igQtCountCellVerticesWidget::SetOriginDataObject(iGame::DataObject::Pointer obj) {
     this->m_OriginDataObject = obj;
-    m_Counts = nullptr;  // 换了模型，旧统计结果作废
+    m_Counts = nullptr;       // 换了模型，旧统计结果作废
+    m_ResultMesh = nullptr;   // 旧结果节点作废
+    m_Generated = false;
 }
 
 // ------------------------------------------------------------------
-// 按名字从属性集里找 cell_vertex_count 数组
+// 按名字 + 挂载位置（IG_CELL）从属性集里找 cell_vertex_count 数组
 // ------------------------------------------------------------------
 iGame::ArrayObject::Pointer
 igQtCountCellVerticesWidget::FindCountArray(iGame::DataObject::Pointer obj) {
@@ -64,11 +66,12 @@ igQtCountCellVerticesWidget::FindCountArray(iGame::DataObject::Pointer obj) {
     auto attrs = obj->GetAttributeSet();
     if (!attrs) { return nullptr; }
 
-    // 遍历属性集，按名字匹配（AttributeSet 属性包含：指针、类型、挂载点、名字）
+    // 遍历属性集，按名字 + 挂载位置匹配
     auto all = attrs->GetAllAttributes();
     for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
         auto& attr = all->GetElement(i);
         if (attr.isDeleted || !attr.pointer) { continue; }
+        if (attr.attachmentType != IG_CELL) { continue; }
         if (std::string(attr.pointer->GetName()) == "cell_vertex_count") {
             return attr.pointer;
         }
@@ -77,7 +80,7 @@ igQtCountCellVerticesWidget::FindCountArray(iGame::DataObject::Pointer obj) {
 }
 
 // ------------------------------------------------------------------
-// 「执行」：跑 Filter → 填表格
+// 「执行」：跑 Filter → 取独立输出 → 填表格 → 通知主窗口加模型树
 // ------------------------------------------------------------------
 void igQtCountCellVerticesWidget::ExecuteCount() {
     if (!m_OriginDataObject) {
@@ -86,39 +89,66 @@ void igQtCountCellVerticesWidget::ExecuteCount() {
     }
 
     // 标准 Filter 调用：New() → SetInput → Execute
-    // 简单任务不生成新网格，cell_vertex_count 属性直接挂在输入模型上
     m_Filter->SetInput(m_OriginDataObject);
     if (!m_Filter->Execute()) {
-        QMessageBox::critical(this, "执行失败", "CountCellVerticesFilter 执行失败，请查看日志。");
+        const QString reason = QString::fromStdString(m_Filter->GetMessage());
+        QMessageBox::critical(this, "执行失败",
+                              reason.isEmpty()
+                                  ? QStringLiteral("CountCellVerticesFilter 执行失败，请查看日志。")
+                                  : reason);
         return;
     }
 
-    // 从输出（= 输入模型）取回属性数组
-    m_Counts = FindCountArray(m_OriginDataObject);
+    // 结果来自独立输出节点（不是原模型）
+    m_ResultMesh = iGame::DynamicCast<iGame::UnstructuredMesh>(m_Filter->GetOutput());
+    if (!m_ResultMesh) {
+        QMessageBox::critical(this, "执行失败", "输出结果不是有效的网格。");
+        return;
+    }
+
+    m_Counts = FindCountArray(m_ResultMesh);
     if (!m_Counts) {
-        QMessageBox::critical(this, "执行失败", "未找到 cell_vertex_count 属性数组。");
+        // 理论上"执行成功必有数组"，这里只是兜底
+        QMessageBox::critical(this, "执行失败", "输出网格中未找到 cell_vertex_count 属性数组。");
         return;
     }
 
     FillTable(m_Counts);
+
+    // 通知主窗口：首次加入模型树，之后只刷新
+    if (m_Generated) {
+        emit UpdateCountModel(m_ResultMesh);
+    } else {
+        emit DrawCountModel(m_ResultMesh);
+        m_Generated = true;
+    }
 }
 
 // ------------------------------------------------------------------
-// 填充表格 + 更新摘要
+// 填充表格 + 更新摘要（只填前 kMaxTableRows 行，避免大模型卡顿）
 // ------------------------------------------------------------------
 void igQtCountCellVerticesWidget::FillTable(iGame::ArrayObject::Pointer counts) {
-    IGsize n = counts->GetNumberOfValues();  // 数组长度 = 单元数
-    ui->tableWidget->setRowCount(static_cast<int>(n));
+    const IGsize n = counts->GetNumberOfValues();                 // 数组长度 = 单元数
+    const IGsize shown = (n < kMaxTableRows) ? n : kMaxTableRows; // 实际显示的单元数
 
-    // 统计顶点数范围（min~max）用于摘要
-    IGsize minV = (n > 0) ? static_cast<IGsize>(counts->GetValue(0)) : 0;
-    IGsize maxV = minV;
-    for (IGsize i = 0; i < n; ++i) {
-        IGsize v = static_cast<IGsize>(counts->GetValue(i));
-        if (v < minV) { minV = v; }
-        if (v > maxV) { maxV = v; }
+    // 统计顶点数范围（min~max）—— 全量统计，与表格显示多少无关
+    IGsize minV = 0;
+    IGsize maxV = 0;
+    if (n > 0) {
+        minV = maxV = static_cast<IGsize>(counts->GetValue(0));
+        for (IGsize i = 1; i < n; ++i) {
+            const IGsize v = static_cast<IGsize>(counts->GetValue(i));
+            if (v < minV) { minV = v; }
+            if (v > maxV) { maxV = v; }
+        }
+    }
 
-        // 单元格：单元编号 | 顶点数（注意 setItem 接管内存，每次 new 一个）
+    // 批量填充：先暂停重绘，减少大模型下的界面卡顿
+    ui->tableWidget->setUpdatesEnabled(false);
+    ui->tableWidget->setRowCount(static_cast<int>(shown));
+    for (IGsize i = 0; i < shown; ++i) {
+        const IGsize v = static_cast<IGsize>(counts->GetValue(i));
+
         auto* idItem = new QTableWidgetItem(QString::number(static_cast<long long>(i)));
         auto* cntItem = new QTableWidgetItem(QString::number(static_cast<long long>(v)));
         idItem->setTextAlignment(Qt::AlignCenter);
@@ -126,16 +156,29 @@ void igQtCountCellVerticesWidget::FillTable(iGame::ArrayObject::Pointer counts) 
         ui->tableWidget->setItem(static_cast<int>(i), 0, idItem);
         ui->tableWidget->setItem(static_cast<int>(i), 1, cntItem);
     }
+    ui->tableWidget->setUpdatesEnabled(true);
 
-    // 摘要：共 N 个单元，顶点数范围 min ~ max
-    ui->lblSummary->setText(QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3")
-                                .arg(static_cast<long long>(n))
-                                .arg(static_cast<long long>(minV))
-                                .arg(static_cast<long long>(maxV)));
+    // 摘要：空模型、截断、完整三种情况分别提示
+    QString summary;
+    if (n == 0) {
+        summary = QStringLiteral("该模型没有单元（0 个），未生成顶点统计数据。");
+    } else if (n > shown) {
+        summary = QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3（表格仅显示前 %4 个，完整数据请用「导出CSV」）")
+                      .arg(static_cast<long long>(n))
+                      .arg(static_cast<long long>(minV))
+                      .arg(static_cast<long long>(maxV))
+                      .arg(static_cast<long long>(shown));
+    } else {
+        summary = QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3")
+                      .arg(static_cast<long long>(n))
+                      .arg(static_cast<long long>(minV))
+                      .arg(static_cast<long long>(maxV));
+    }
+    ui->lblSummary->setText(summary);
 }
 
 // ------------------------------------------------------------------
-// 「导出CSV」：把表格存成 .csv 文件（答辩可展示数据）
+// 「导出CSV」：把完整统计数据存成 .csv 文件（不截断，含全部单元）
 // ------------------------------------------------------------------
 void igQtCountCellVerticesWidget::ExportCSV() {
     if (!m_Counts || m_Counts->GetNumberOfValues() == 0) {
