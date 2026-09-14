@@ -12,19 +12,22 @@ IGAME_NAMESPACE_BEGIN
  * @class CountCellVerticesFilter
  * @brief 统计每个单元的顶点数，结果写入独立输出网格的 Cell Data：cell_vertex_count。
  *
- * 【输出约定：独立结果节点】
- *   本 Filter 不修改输入数据，而是新建一个 UnstructuredMesh 作为输出：
- *   - 点与单元（几何/拓扑）以只读方式共享输入，不复制数据；
- *   - 属性集为**新建**的 AttributeSet，输入原有的属性数组按引用搬过去（不深拷贝数据）；
+ * 【输出约定：完全独立的输出节点】
+ *   本 Filter 不修改输入数据，而是深拷贝出一个全新的 UnstructuredMesh 作为输出：
+ *   - 点、单元连接表、单元类型表全部深拷贝（指针级独立，不共享输入内存）；
+ *   - 属性集为新建的 AttributeSet，输入的全部属性数组（含整数等各类型）逐个深拷贝；
  *   - 统计结果作为新的 Cell Data 数组 cell_vertex_count 写入输出网格。
- *   因此原模型的属性不会被动过，模型树里也可以把输出作为一个独立节点查看。
+ *   因此输入网格绝对不受影响，输出可作为模型树中的独立节点查看、着色。
  *
  * 【空的模型处理】
- *   输入没有任何单元时仍然算"执行成功"，但会产出一个长度为 0 的 cell_vertex_count 数组，
+ *   输入没有任何单元时仍然算"执行成功"，产出一个长度为 0 的 cell_vertex_count 数组，
  *   保证"执行成功 ⇒ 数组一定存在"，界面不会出现"找不到数组"的矛盾状态。
  *
  * 【重复执行】
- *   写结果前会先删除输出属性集中同名的旧数组，重复执行不会不断追加同名数组。
+ *   深拷贝属性时跳过旧的 cell_vertex_count，重复执行不会累积同名数组。
+ *
+ * 【异常安全】
+ *   Execute() 捕获异常并清空输出，失败返回 false 且不残留旧结果。
  */
 class CountCellVerticesFilter : public Filter {
 
@@ -39,6 +42,9 @@ public:
 protected:
     CountCellVerticesFilter();
     ~CountCellVerticesFilter() override = default;
+
+    /// 执行主体逻辑（不含异常捕获，由 Execute 包裹）
+    bool ExecuteInternal();
 
     /// 最近一次执行的信息
     std::string m_Message;

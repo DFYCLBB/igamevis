@@ -9,6 +9,7 @@
 #include "iGameUnstructuredMesh.h"  // 非结构网格类型（最通用，任意混合单元）
 #include "iGameVolumeMesh.h"        // 体网格类型（四面体/六面体等）
 
+#include <exception>
 #include <string>
 
 IGAME_NAMESPACE_BEGIN
@@ -19,25 +20,72 @@ namespace {
 constexpr const char* kArrayName = "cell_vertex_count";
 
 /**
- * 属性集的"浅搬运"：把源属性集里的数组按**引用**搬进目标属性集（不复制数组数据）。
- * 只读共享，性能友好；目标属性集是独立对象，之后的增删不会影响源属性集。
+ * 深拷贝一个数组（元素 + 名字 + 维度），返回同类型的新数组。
  */
-void CopyAttributesShallow(AttributeSet::Pointer src, AttributeSet::Pointer dst) {
-    if (src == nullptr || dst == nullptr) { return; }
+template <typename T>
+typename T::Pointer DeepCopyArray(typename T::Pointer src) {
+    if (src == nullptr) { return nullptr; }
+    auto dst = T::New();
+    dst->DeepCopy(src);
+    return dst;
+}
+
+/**
+ * 按数组实际类型深拷贝一个属性数组（覆盖框架全部 FlatArray 类型）。
+ * 注：框架的 AttributeSet::Attribute::DeepCopy 只支持 Float/Double，
+ * 这里补齐整数等其余类型，避免属性被静默丢弃。
+ */
+ArrayObject::Pointer CopyAttribute(ArrayObject::Pointer source) {
+    if (source == nullptr) { return nullptr; }
+    ArrayObject::Pointer copy;
+    switch (source->GetArrayType()) {
+#define COPY_ATTRIBUTE(Type) \
+    case IG_##Type: copy = DeepCopyArray<Type>(DynamicCast<Type>(source)); break;
+        COPY_ATTRIBUTE(FloatArray)
+        COPY_ATTRIBUTE(DoubleArray)
+        COPY_ATTRIBUTE(IntArray)
+        COPY_ATTRIBUTE(UnsignedIntArray)
+        COPY_ATTRIBUTE(CharArray)
+        COPY_ATTRIBUTE(UnsignedCharArray)
+        COPY_ATTRIBUTE(ShortArray)
+        COPY_ATTRIBUTE(UnsignedShortArray)
+        COPY_ATTRIBUTE(LongLongArray)
+        COPY_ATTRIBUTE(UnsignedLongLongArray)
+#undef COPY_ATTRIBUTE
+        default: break;
+    }
+    return copy;
+}
+
+/**
+ * 深拷贝属性集：新建 AttributeSet，逐个深拷贝所有属性（含 dataRange），
+ * 并跳过旧的 cell_vertex_count 结果数组（重复执行不会累积同名数组）。
+ */
+AttributeSet::Pointer DeepCopyAttributes(AttributeSet::Pointer src) {
+    auto dst = AttributeSet::New();
+    if (src == nullptr) { return dst; }
     auto all = src->GetAllAttributes();
-    if (all == nullptr) { return; }
+    if (all == nullptr) { return dst; }
     for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
         auto& attr = all->GetElement(i);
         if (attr.isDeleted || attr.pointer == nullptr) { continue; }
-        dst->AddAttribute(attr.type, attr.attachmentType, attr.pointer, attr.dataRange);
+        if (attr.attachmentType == IG_CELL && attr.pointer->GetName() == kArrayName) {
+            continue;  // 旧结果数组不复制，下面会写入最新结果
+        }
+        auto copy = CopyAttribute(attr.pointer);
+        if (copy == nullptr) { continue; }  // 不支持的类型保守跳过
+        DoubleArray::Pointer copyRange = nullptr;
+        if (attr.dataRange != nullptr) {
+            copyRange = DoubleArray::New();
+            copyRange->DeepCopy(attr.dataRange);
+        }
+        if (copyRange != nullptr) {
+            dst->AddAttribute(attr.type, attr.attachmentType, copy, copyRange);
+        } else {
+            dst->AddAttribute(attr.type, attr.attachmentType, copy);
+        }
     }
-}
-
-/// 写结果前先删掉同名数组：重复执行时只保留一份，且永远是最新结果
-void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
-    if (attrs == nullptr) { return; }
-    const int index = attrs->GetAttributeIndex(name);
-    if (index >= 0) { attrs->DeleteAttribute(index); }
+    return dst;
 }
 
 /**
@@ -59,6 +107,27 @@ UnsignedIntArray::Pointer BuildCellTypesFromPointCount(CellArray::Pointer cells,
     return types;
 }
 
+/**
+ * 深拷贝单元连接表（逐单元 AddCellIds 重建）。
+ *
+ * 为什么不用 CellArray::DeepCopy：框架的 CellArray::DeepCopy 对"变长单元"
+ * （m_UseOffsets == true，即各单元点数不一的网格）存在缺陷——它对 m_Offsets 做的是
+ * "追加"而非"覆盖"，而 CellArray 构造时 m_Offsets 已预置一个 0，导致偏移数组错位
+ * （变成 [0, 0, 8, ...]），GetCellSize 会算错。逐单元 AddCellIds 能正确重建
+ * 连接表与偏移表，规避该 bug。
+ */
+CellArray::Pointer DeepCopyCellArray(CellArray::Pointer src) {
+    if (src == nullptr) { return nullptr; }
+    auto dst = CellArray::New();
+    const IGsize n = src->GetNumberOfCells();
+    igIndex ids[IGAME_CELL_MAX_SIZE] = {0};
+    for (IGsize i = 0; i < n; ++i) {
+        const int vcnt = src->GetCellIds(i, ids);
+        dst->AddCellIds(ids, vcnt);
+    }
+    return dst;
+}
+
 }  // namespace
 
 CountCellVerticesFilter::CountCellVerticesFilter() {
@@ -69,7 +138,23 @@ CountCellVerticesFilter::CountCellVerticesFilter() {
 bool CountCellVerticesFilter::Execute() {
     UpdateProgress(0);
     m_Message.clear();
+    SetOutput(0, nullptr);  // 重入/失败时不残留旧输出
 
+    try {
+        return ExecuteInternal();
+    } catch (const std::exception& e) {
+        SetOutput(0, nullptr);
+        m_Message = std::string("CountCellVerticesFilter exception: ") + e.what();
+        IGAME_CORE_ERROR("{}", m_Message);
+        return false;
+    } catch (...) {
+        SetOutput(0, nullptr);
+        m_Message = "CountCellVerticesFilter unknown exception";
+        return false;
+    }
+}
+
+bool CountCellVerticesFilter::ExecuteInternal() {
     if (m_Inputs->GetNumberOfElements() == 0) {
         m_Message = "no input data";
         return false;
@@ -120,7 +205,8 @@ bool CountCellVerticesFilter::Execute() {
         }
         default:
             m_Message = "unsupported data type, only UnstructuredMesh / SurfaceMesh / VolumeMesh are supported";
-            IGAME_CORE_ERROR("CountCellVerticesFilter: unsupported data type {}", static_cast<int>(input->GetDataObjectType()));
+            IGAME_CORE_ERROR("CountCellVerticesFilter: unsupported data type {}",
+                             static_cast<int>(input->GetDataObjectType()));
             return false;
     }
     if (cells == nullptr) {
@@ -131,21 +217,30 @@ bool CountCellVerticesFilter::Execute() {
         m_Message = "cannot determine cell types";
         return false;
     }
+    if (points == nullptr) {
+        m_Message = "input mesh has no points";
+        return false;
+    }
 
     const IGsize numCells = cells->GetNumberOfCells();
 
-    // —— 独立输出节点：新建网格；点/单元只读共享输入，属性集新建（不污染输入） ——
+    // —— 独立输出节点：几何/拓扑/属性全部深拷贝，指针级独立，绝不共享输入 ——
     auto outMesh = UnstructuredMesh::New();
     outMesh->SetName(input->GetName() + "_VertexCount");
-    outMesh->SetPoints(points);
-    outMesh->SetCells(cells, cellTypes);
 
-    auto outAttrs = AttributeSet::New();
-    CopyAttributesShallow(input->GetAttributeSet(), outAttrs);
+    auto outPoints = Points::New();
+    outPoints->DeepCopy(points);
+    outMesh->SetPoints(outPoints);
+
+    auto outCells = DeepCopyCellArray(cells);
+    auto outTypes = UnsignedIntArray::New();
+    outTypes->DeepCopy(cellTypes);
+    outMesh->SetCells(outCells, outTypes);
+
+    auto outAttrs = DeepCopyAttributes(input->GetAttributeSet());
     outMesh->SetAttributeSet(outAttrs);
 
-    // —— 结果数组：先删同名再加，保证"只有一份、且是最新值" ——
-    RemoveArrayIfExists(outAttrs, kArrayName);
+    // —— 结果数组：写入最新统计值 ——
     auto vertexCounts = DoubleArray::New();
     vertexCounts->SetName(kArrayName);
     vertexCounts->SetDimension(1);
@@ -162,8 +257,6 @@ bool CountCellVerticesFilter::Execute() {
     }
 
     UpdateProgress(1);
-    // 输出网格的渲染数据由使用方（GUI 面板）在需要渲染时再生成；
-    // 这里不强制重建，避免与 GUI 复用结果容器时的重建重复（大模型重复重建开销大）
     SetOutput(0, outMesh);
     return true;
 }

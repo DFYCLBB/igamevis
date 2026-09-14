@@ -117,6 +117,12 @@ void TestMixedCells() {
     Check(out.GetPointer() != mesh.GetPointer(),
           "output is an independent data object (counts are NOT written into the input)");
     Check(out->GetNumberOfCells() == inCells, "output keeps the same cell count");
+    Check(out->GetPoints() != mesh->GetPoints(),
+          "output points are deep-copied (independent buffer, not shared with input)");
+    Check(out->GetCells() != mesh->GetCells(),
+          "output cell array is deep-copied (independent buffer, not shared with input)");
+    Check(out->GetAttributeSet() != mesh->GetAttributeSet(),
+          "output attribute set is a new object (not shared with input)");
 
     auto counts = FindArray(out, "cell_vertex_count", IG_CELL);
     Check(counts != nullptr, "output has Cell Data 'cell_vertex_count'");
