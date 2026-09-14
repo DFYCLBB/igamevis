@@ -162,8 +162,8 @@ bool CountCellVerticesFilter::Execute() {
     }
 
     UpdateProgress(1);
-    // 只对输出网格刷新渲染数据（输入没有被改动，不需要刷新）
-    outMesh->ForceReConvertToDrawableData();
+    // 输出网格的渲染数据由使用方（GUI 面板）在需要渲染时再生成；
+    // 这里不强制重建，避免与 GUI 复用结果容器时的重建重复（大模型重复重建开销大）
     SetOutput(0, outMesh);
     return true;
 }

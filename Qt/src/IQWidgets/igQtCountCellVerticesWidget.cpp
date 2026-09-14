@@ -17,6 +17,12 @@ igQtCountCellVerticesWidget::igQtCountCellVerticesWidget(QWidget* parent)
     // 按钮 → 槽
     connect(ui->btnExecute, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::ExecuteCount);
     connect(ui->btnExportCSV, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::ExportCSV);
+    connect(ui->btnPrevPage, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::PrevPage);
+    connect(ui->btnNextPage, &QPushButton::clicked, this, &igQtCountCellVerticesWidget::NextPage);
+
+    // 翻页按钮初始禁用（执行后按数据量启用）
+    ui->btnPrevPage->setEnabled(false);
+    ui->btnNextPage->setEnabled(false);
 
     // 表格初始化：两列表头 + 拉伸
     QStringList headers;
@@ -46,7 +52,6 @@ igQtCountCellVerticesWidget::igQtCountCellVerticesWidget(QWidget* parent)
         }
         QTableCornerButton::section { background-color: #3a3a3a; }
     )");
-    // 深色交替行（#2b2b2b / #3a3a3a）都配浅色文字，保证每行都可读
     ui->tableWidget->setAlternatingRowColors(true);
 }
 
@@ -55,6 +60,7 @@ void igQtCountCellVerticesWidget::SetOriginDataObject(iGame::DataObject::Pointer
     m_Counts = nullptr;       // 换了模型，旧统计结果作废
     m_ResultMesh = nullptr;   // 旧结果节点作废
     m_Generated = false;
+    m_currentPage = 0;
 }
 
 // ------------------------------------------------------------------
@@ -100,11 +106,22 @@ void igQtCountCellVerticesWidget::ExecuteCount() {
     }
 
     // 结果来自独立输出节点（不是原模型）
-    m_ResultMesh = iGame::DynamicCast<iGame::UnstructuredMesh>(m_Filter->GetOutput());
-    if (!m_ResultMesh) {
+    auto out = iGame::DynamicCast<iGame::UnstructuredMesh>(m_Filter->GetOutput());
+    if (!out) {
         QMessageBox::critical(this, "执行失败", "输出结果不是有效的网格。");
         return;
     }
+
+    // 复用结果容器：场景里始终是同一个结果对象，重复执行时数据被正确覆盖刷新，
+    // 不会在场景里累积多个结果模型（避免多模型叠加渲染导致的卡顿）
+    if (!m_ResultMesh) {
+        m_ResultMesh = iGame::UnstructuredMesh::New();
+        m_ResultMesh->SetName(m_OriginDataObject->GetName() + "_VertexCount");
+    }
+    m_ResultMesh->SetPoints(out->GetPoints());
+    m_ResultMesh->SetCells(out->GetCells(), out->GetCellTypes());
+    m_ResultMesh->SetAttributeSet(out->GetAttributeSet());
+    m_ResultMesh->ForceReConvertToDrawableData();  // 结果几何/属性已更新，重建渲染数据
 
     m_Counts = FindCountArray(m_ResultMesh);
     if (!m_Counts) {
@@ -113,9 +130,10 @@ void igQtCountCellVerticesWidget::ExecuteCount() {
         return;
     }
 
-    FillTable(m_Counts);
+    m_currentPage = 0;  // 每次执行回到第一页
+    ShowPage();
 
-    // 通知主窗口：首次加入模型树，之后只刷新
+    // 通知主窗口：首次加入模型树（并隐藏原模型），之后只刷新
     if (m_Generated) {
         emit UpdateCountModel(m_ResultMesh);
     } else {
@@ -125,31 +143,47 @@ void igQtCountCellVerticesWidget::ExecuteCount() {
 }
 
 // ------------------------------------------------------------------
-// 填充表格 + 更新摘要（只填前 kMaxTableRows 行，避免大模型卡顿）
+// 按当前页填充表格 + 更新页码 / 摘要 / 翻页按钮状态
 // ------------------------------------------------------------------
-void igQtCountCellVerticesWidget::FillTable(iGame::ArrayObject::Pointer counts) {
-    const IGsize n = counts->GetNumberOfValues();                 // 数组长度 = 单元数
-    const IGsize shown = (n < kMaxTableRows) ? n : kMaxTableRows; // 实际显示的单元数
+void igQtCountCellVerticesWidget::ShowPage() {
+    if (!m_Counts) {
+        ui->tableWidget->setRowCount(0);
+        ui->lblPageInfo->setText(QStringLiteral("第 0 / 0 页"));
+        ui->btnPrevPage->setEnabled(false);
+        ui->btnNextPage->setEnabled(false);
+        return;
+    }
 
-    // 统计顶点数范围（min~max）—— 全量统计，与表格显示多少无关
+    const IGsize n = m_Counts->GetNumberOfValues();                // 数组长度 = 单元数
+    const int pageCount = n == 0 ? 0 : static_cast<int>((n + kPageSize - 1) / kPageSize);
+    if (m_currentPage < 0) { m_currentPage = 0; }
+    if (pageCount > 0 && m_currentPage >= pageCount) { m_currentPage = pageCount - 1; }
+    if (pageCount == 0) { m_currentPage = 0; }
+
+    const IGsize start = static_cast<IGsize>(m_currentPage) * kPageSize;
+    const IGsize end = (start + kPageSize < n) ? (start + kPageSize) : n;
+    const IGsize shown = end - start;
+
+    // 统计顶点数范围（min~max）—— 全量统计，与当前页无关
     IGsize minV = 0;
     IGsize maxV = 0;
     if (n > 0) {
-        minV = maxV = static_cast<IGsize>(counts->GetValue(0));
+        minV = maxV = static_cast<IGsize>(m_Counts->GetValue(0));
         for (IGsize i = 1; i < n; ++i) {
-            const IGsize v = static_cast<IGsize>(counts->GetValue(i));
+            const IGsize v = static_cast<IGsize>(m_Counts->GetValue(i));
             if (v < minV) { minV = v; }
             if (v > maxV) { maxV = v; }
         }
     }
 
-    // 批量填充：先暂停重绘，减少大模型下的界面卡顿
+    // 只填当前页的行
     ui->tableWidget->setUpdatesEnabled(false);
     ui->tableWidget->setRowCount(static_cast<int>(shown));
     for (IGsize i = 0; i < shown; ++i) {
-        const IGsize v = static_cast<IGsize>(counts->GetValue(i));
+        const IGsize cellId = start + i;
+        const IGsize v = static_cast<IGsize>(m_Counts->GetValue(cellId));
 
-        auto* idItem = new QTableWidgetItem(QString::number(static_cast<long long>(i)));
+        auto* idItem = new QTableWidgetItem(QString::number(static_cast<long long>(cellId)));
         auto* cntItem = new QTableWidgetItem(QString::number(static_cast<long long>(v)));
         idItem->setTextAlignment(Qt::AlignCenter);
         cntItem->setTextAlignment(Qt::AlignCenter);
@@ -158,16 +192,16 @@ void igQtCountCellVerticesWidget::FillTable(iGame::ArrayObject::Pointer counts) 
     }
     ui->tableWidget->setUpdatesEnabled(true);
 
-    // 摘要：空模型、截断、完整三种情况分别提示
+    // 摘要
     QString summary;
     if (n == 0) {
         summary = QStringLiteral("该模型没有单元（0 个），未生成顶点统计数据。");
-    } else if (n > shown) {
-        summary = QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3（表格仅显示前 %4 个，完整数据请用「导出CSV」）")
+    } else if (pageCount > 1) {
+        summary = QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3（共 %4 页，用下方按钮翻页，或「导出CSV」看全量）")
                       .arg(static_cast<long long>(n))
                       .arg(static_cast<long long>(minV))
                       .arg(static_cast<long long>(maxV))
-                      .arg(static_cast<long long>(shown));
+                      .arg(pageCount);
     } else {
         summary = QStringLiteral("共 %1 个单元，顶点数范围 %2 ~ %3")
                       .arg(static_cast<long long>(n))
@@ -175,6 +209,29 @@ void igQtCountCellVerticesWidget::FillTable(iGame::ArrayObject::Pointer counts) 
                       .arg(static_cast<long long>(maxV));
     }
     ui->lblSummary->setText(summary);
+
+    // 页码与翻页按钮
+    ui->lblPageInfo->setText(pageCount == 0
+                                 ? QStringLiteral("第 0 / 0 页")
+                                 : QStringLiteral("第 %1 / %2 页").arg(m_currentPage + 1).arg(pageCount));
+    ui->btnPrevPage->setEnabled(m_currentPage > 0);
+    ui->btnNextPage->setEnabled(pageCount > 0 && m_currentPage + 1 < pageCount);
+}
+
+void igQtCountCellVerticesWidget::PrevPage() {
+    if (m_currentPage > 0) {
+        --m_currentPage;
+        ShowPage();
+    }
+}
+
+void igQtCountCellVerticesWidget::NextPage() {
+    const IGsize n = m_Counts ? m_Counts->GetNumberOfValues() : 0;
+    const int pageCount = n == 0 ? 0 : static_cast<int>((n + kPageSize - 1) / kPageSize);
+    if (m_currentPage + 1 < pageCount) {
+        ++m_currentPage;
+        ShowPage();
+    }
 }
 
 // ------------------------------------------------------------------

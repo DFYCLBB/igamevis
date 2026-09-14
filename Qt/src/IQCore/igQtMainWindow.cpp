@@ -6689,15 +6689,23 @@ void igQtMainWindow::initAllMySignalConnections() {
         rendererWidget->update();
     });
 
-    // —— 统计单元顶点数：结果作为独立节点加入模型树，可按 cell_vertex_count 着色 ——
+    // —— 统计单元顶点数：对标 ParaView，结果替换输入显示（隐藏原模型，只显示结果节点）——
     connect(ui->widget_CountCellVertices, &igQtCountCellVerticesWidget::DrawCountModel, this,
             [&](iGame::DataObject::Pointer res) {
+                // 通过模型树项隐藏原模型（眼睛图标会同步成“闭眼”，点该眼睛即可恢复显示，同 ParaView）
+                auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
+                if (scene) {
+                    auto current = scene->GetCurrentModel();
+                    if (current) {
+                        auto* item = modelTreeWidget->getItemFromObject(current->GetDataObject());
+                        if (item) { item->changeVisibility(false); }
+                    }
+                }
                 modelTreeWidget->addDataObjectToModelTree(res, ItemSource::Algorithm);
             });
     connect(ui->widget_CountCellVertices, &igQtCountCellVerticesWidget::UpdateCountModel, this,
             [&](DataObject::Pointer res) {
                 modelTreeWidget->updateCurrentModelInfo();
-                modelTreeWidget->updateAllAttriubute(res);
                 rendererWidget->update();
             });
 
