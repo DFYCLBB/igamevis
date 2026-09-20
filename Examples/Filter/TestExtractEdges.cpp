@@ -1,9 +1,13 @@
 #include <ExtractEdges/iGameExtractEdgesFilter.h>
 
+#include <Core/iGameScene.h>
 #include <filesystem>
 #include <iGameAttributeSet.h>
+#include <iGameDrawObject.h>
 #include <iGameFileIO.h>
 #include <iGameFlatArray.h>
+#include <iGameInteractor.h>
+#include <iGameRenderWindow.h>
 #include <iGameUnstructuredMesh.h>
 #include <iostream>
 #include <string>
@@ -210,6 +214,34 @@ void TestEmptyMesh() {
     }
 }
 
+/// 可视化演示：读六面体网格，提取边并以线框形式弹出渲染窗口（便于录屏对照）
+void VisualizeEdgesResult() {
+    auto mesh = LoadMesh("./Models/ExtractEdges_hexa_grid.vtk");
+    if (mesh == nullptr) { return; }
+
+    auto filter = iGame::ExtractEdgesFilter::New();
+    filter->SetInput(mesh);
+    if (!filter->Execute()) { return; }
+    auto out = iGame::DynamicCast<iGame::UnstructuredMesh>(filter->GetOutput());
+    if (out == nullptr) { return; }
+
+    auto scene = iGame::Scene::New();
+    auto draw = iGame::DynamicCast<iGame::DrawObject>(out);
+    if (draw != nullptr) {
+        draw->SetViewStyle(IG_WIREFRAME);
+    }
+    scene->AddModel(out);
+
+    auto window = iGame::RenderWindow::New();
+    window->SetSize(1280, 720);
+    window->SetScene(scene);
+    auto interactor = iGame::Interactor::New();
+    interactor->Initialize(scene);
+    interactor->CreateDefaultStyle();
+    window->SetInteractor(interactor);
+    window->Show();
+}
+
 }  // namespace
 
 int main() {
@@ -220,8 +252,12 @@ int main() {
 
     if (g_failed == 0) {
         std::cerr << "[testExtractEdges] PASS: all checks passed\n";
-        return 0;
+    } else {
+        std::cerr << "[testExtractEdges] FAIL: " << g_failed << " check(s) failed\n";
     }
-    std::cerr << "[testExtractEdges] FAIL: " << g_failed << " check(s) failed\n";
-    return 1;
+
+    // —— 可视化演示：提取边以线框形式弹出渲染窗口 ——
+    VisualizeEdgesResult();
+
+    return (g_failed == 0) ? 0 : 1;
 }
