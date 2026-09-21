@@ -10,6 +10,7 @@
 #include "iGameVolumeMesh.h"        // 体网格类型（四面体/六面体等）
 
 #include <exception>
+#include <set>
 #include <string>
 
 IGAME_NAMESPACE_BEGIN
@@ -105,6 +106,38 @@ UnsignedIntArray::Pointer BuildCellTypesFromPointCount(CellArray::Pointer cells,
         types->AddValue(type);
     }
     return types;
+}
+
+/**
+ * 统计一个单元的"顶点数"（按 cellType 分派）。
+ *
+ * 普通单元：连接表里存的就是它的点，连接表长度 = 点数。
+ *
+ * 多面体 IG_POLYHEDRON 是**变长单元**，连接表是展开格式：
+ *     [面数, 面1点数, 面1点索引..., 面2点数, 面2点索引..., ...]
+ * 这时连接表长度是"这段展开数据的长度"（立方体 = 31），并不是顶点数。
+ * 必须解析出所有面的点索引并**去重**（同一顶点会被相邻多个面重复引用），
+ * 得到真实顶点数（立方体 = 8）。
+ * 参照：主仓库 CellSizeFilter 同样按 cellType 分派，注释明确提醒
+ *     "avoid misusing formulas on variable-length cells (IG_POLYHEDRON etc.)"。
+ */
+IGsize CountVerticesOfCell(CellArray::Pointer cells, IGsize cellId, IGenum cellType) {
+    if (cells == nullptr) { return 0; }
+    igIndex ids[IGAME_CELL_MAX_SIZE] = {0};
+    const int size = cells->GetCellIds(cellId, ids);
+    if (size <= 0) { return 0; }
+    if (cellType != IG_POLYHEDRON) {
+        return static_cast<IGsize>(size);
+    }
+    std::set<igIndex> uniquePoints;
+    int index = 1;  // 跳过开头的"面数"
+    while (index < size) {
+        const int facePointCount = ids[index++];
+        for (int k = 0; k < facePointCount && index < size; ++k) {
+            uniquePoints.insert(ids[index++]);
+        }
+    }
+    return static_cast<IGsize>(uniquePoints.size());
 }
 
 /**
@@ -246,7 +279,8 @@ bool CountCellVerticesFilter::ExecuteInternal() {
     vertexCounts->SetDimension(1);
     vertexCounts->Reserve(numCells);
     for (IGsize i = 0; i < numCells; ++i) {
-        const double count = static_cast<double>(cells->GetCellSize(i));
+        const IGenum cellType = cellTypes->GetValue(i);
+        const double count = static_cast<double>(CountVerticesOfCell(cells, i, cellType));
         vertexCounts->AddElement(&count);
     }
     outAttrs->AddScalar(IG_CELL, vertexCounts);

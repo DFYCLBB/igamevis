@@ -21,31 +21,7 @@ namespace {
 /// 输出网格的 Cell Data：每条边的来源单元编号
 constexpr const char* kSourceCellArrayName = "edge_source_cell";
 
-/**
- * 只搬运"点数据"（IG_POINT）属性：输出网格点数与输入相同，语义仍然成立。
- * 单元数据（IG_CELL）**不能搬**——输入单元数是 N、输出是边数 M，长度对不上，
- * 沿用会造成属性与单元错位（复测反馈的 cell data mismatch 问题）。
- */
-void CopyPointAttributesShallow(AttributeSet::Pointer src, AttributeSet::Pointer dst) {
-    if (src == nullptr || dst == nullptr) { return; }
-    auto all = src->GetAllAttributes();
-    if (all == nullptr) { return; }
-    for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
-        auto& attr = all->GetElement(i);
-        if (attr.isDeleted || attr.pointer == nullptr) { continue; }
-        if (attr.attachmentType != IG_POINT) { continue; }
-        dst->AddAttribute(attr.type, attr.attachmentType, attr.pointer, attr.dataRange);
-    }
-}
-
-/// 写结果前先删掉同名数组，保证重复执行不会堆积同名数组
-void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
-    if (attrs == nullptr) { return; }
-    const int index = attrs->GetAttributeIndex(name);
-    if (index >= 0) { attrs->DeleteAttribute(index); }
-}
-
-/// 按实际类型创建一个同类型的空数组（用于按来源单元重映射 Cell Data）
+/// 按实际类型创建一个同类型的空数组（点数据深拷贝 / 单元数据重映射共用）
 ArrayObject::Pointer NewArrayLike(ArrayObject::Pointer src) {
     if (src == nullptr) { return nullptr; }
     switch (src->GetArrayType()) {
@@ -63,6 +39,62 @@ ArrayObject::Pointer NewArrayLike(ArrayObject::Pointer src) {
 #undef NEW_ARRAY_LIKE
         default: return nullptr;
     }
+}
+
+/**
+ * 深拷贝一个属性数组（同类型 + 名字 + 维度 + 全部值）。
+ * 用 DeepCopy/ShallowCopy 之外的显式逐值拷贝，保证输出与输入指针级独立。
+ */
+ArrayObject::Pointer DeepCopyArray(ArrayObject::Pointer src) {
+    if (src == nullptr) { return nullptr; }
+    auto dst = NewArrayLike(src);
+    if (dst == nullptr) { return nullptr; }
+    const int dim = src->GetDimension();
+    if (dim <= 0) { return nullptr; }
+    dst->SetName(src->GetName());
+    dst->SetDimension(dim);
+    const IGsize values = src->GetNumberOfValues();
+    dst->Resize(values);
+    for (IGsize i = 0; i < values; ++i) {
+        dst->SetValue(i, src->GetValue(i));
+    }
+    return dst;
+}
+
+/**
+ * 深拷贝"点数据"（IG_POINT）属性：输出网格点数与输入相同，语义仍然成立。
+ * 单元数据（IG_CELL）不在这一步处理——它由提取过程按"每条边的来源单元"重映射。
+ * 之所以深拷贝而不是共享：与 CountCellVertices 保持一致的独立性（指针级独立），
+ * 避免输出与输入共享同一份数组导致下游修改互相污染。
+ */
+void DeepCopyPointAttributes(AttributeSet::Pointer src, AttributeSet::Pointer dst) {
+    if (src == nullptr || dst == nullptr) { return; }
+    auto all = src->GetAllAttributes();
+    if (all == nullptr) { return; }
+    for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
+        auto& attr = all->GetElement(i);
+        if (attr.isDeleted || attr.pointer == nullptr) { continue; }
+        if (attr.attachmentType != IG_POINT) { continue; }
+        auto copy = DeepCopyArray(attr.pointer);
+        if (copy == nullptr) { continue; }
+        DoubleArray::Pointer copyRange = nullptr;
+        if (attr.dataRange != nullptr) {
+            copyRange = DoubleArray::New();
+            copyRange->DeepCopy(attr.dataRange);
+        }
+        if (copyRange != nullptr) {
+            dst->AddAttribute(attr.type, attr.attachmentType, copy, copyRange);
+        } else {
+            dst->AddAttribute(attr.type, attr.attachmentType, copy);
+        }
+    }
+}
+
+/// 写结果前先删掉同名数组，保证重复执行不会堆积同名数组
+void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
+    if (attrs == nullptr) { return; }
+    const int index = attrs->GetAttributeIndex(name);
+    if (index >= 0) { attrs->DeleteAttribute(index); }
 }
 
 /**
@@ -143,14 +175,17 @@ bool ExtractEdgesFilter::ExecuteWithPointSet(DataObject::Pointer input) {
         return false;
     }
 
-    // —— 独立输出节点：新建边网格，点坐标只读共享输入 ——
+    // —— 独立输出节点：新建边网格；点与点数据全部深拷贝，指针级独立 ——
     auto outMesh = UnstructuredMesh::New();
     outMesh->SetName(input->GetName() + "_Edges");
-    outMesh->SetPoints(um->GetPoints());
 
-    // 属性集新建：Point Data 按引用保留，Cell Data 由提取过程重建
+    auto outPoints = Points::New();
+    outPoints->DeepCopy(um->GetPoints());
+    outMesh->SetPoints(outPoints);
+
+    // 属性集新建：Point Data 深拷贝保留；Cell Data 稍后由提取过程按"来源单元"重建
     auto outAttrs = AttributeSet::New();
-    CopyPointAttributesShallow(input->GetAttributeSet(), outAttrs);
+    DeepCopyPointAttributes(input->GetAttributeSet(), outAttrs);
     outMesh->SetAttributeSet(outAttrs);
 
     if (!ExtractEdgesFromMesh(um, outMesh)) {
@@ -242,6 +277,31 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
 
         if (cellType == IG_VERTEX || cellType == IG_EMPTY_CELL) {
             RecordSkippedCell(cellType);
+            continue;
+        }
+
+        // 多面体是**变长单元**：连接表为展开格式
+        //   [面数, 面1点数, 面1点索引..., 面2点数, 面2点索引..., ...]
+        // 框架的 Polyhedron::GetNumberOfEdges() 恒返回 0、GetEdge() 恒返回 nullptr，
+        // 属于"它其实有边、只是通用接口拿不到"，不能当跳过处理。
+        // 这里直接从展开表解析每个面，取该面的边（相邻点对 + 首尾闭合），去重后即多面体的边。
+        if (cellType == IG_POLYHEDRON) {
+            bool extracted = false;
+            int index = 1;  // 跳过开头的"面数"
+            while (index < vcnt) {
+                const int facePointCount = vhs[index++];
+                if (facePointCount < 2 || index + facePointCount > vcnt) {
+                    break;  // 数据异常，停止解析
+                }
+                for (int k = 0; k < facePointCount; ++k) {
+                    const igIndex a = vhs[index + k];
+                    const igIndex b = vhs[index + (k + 1) % facePointCount];
+                    addEdge(a, b, cid);
+                    extracted = true;
+                }
+                index += facePointCount;
+            }
+            if (!extracted) { RecordSkippedCell(cellType); }
             continue;
         }
 
