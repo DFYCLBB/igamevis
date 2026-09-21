@@ -47,10 +47,12 @@ ArrayObject::Pointer NewArrayLike(ArrayObject::Pointer src) {
  */
 ArrayObject::Pointer DeepCopyArray(ArrayObject::Pointer src) {
     if (src == nullptr) { return nullptr; }
-    auto dst = NewArrayLike(src);
-    if (dst == nullptr) { return nullptr; }
     const int dim = src->GetDimension();
     if (dim <= 0) { return nullptr; }
+    auto dst = NewArrayLike(src);
+    if (dst == nullptr) {
+        dst = DoubleArray::New();  // 未知数组类型兜底为 double，绝不静默丢弃属性
+    }
     dst->SetName(src->GetName());
     dst->SetDimension(dim);
     const IGsize values = src->GetNumberOfValues();
@@ -110,10 +112,12 @@ void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
 ArrayObject::Pointer RemapCellArrayBySource(ArrayObject::Pointer src,
                                             const std::vector<IGuint>& sourceCells) {
     if (src == nullptr) { return nullptr; }
-    auto out = NewArrayLike(src);
-    if (out == nullptr) { return nullptr; }
     const int dim = src->GetDimension();
     if (dim <= 0) { return nullptr; }
+    auto out = NewArrayLike(src);
+    if (out == nullptr) {
+        out = DoubleArray::New();  // 未知数组类型兜底为 double，绝不静默丢弃单元数据
+    }
     out->SetName(src->GetName());
     out->SetDimension(dim);
 
@@ -234,7 +238,9 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
     auto edgeTypes = UnsignedIntArray::New();  // 每条边的类型：IG_LINE
 
     const IGsize numCells = cells->GetNumberOfCells();
-    igIndex vhs[IGAME_CELL_MAX_SIZE] = {0};
+    // 用动态缓冲而不是固定数组：多面体的展开连接表可能远超 IGAME_CELL_MAX_SIZE(256)，
+    // 而 CellArray::GetCellIds 不做边界检查，固定数组会越界写内存。
+    std::vector<igIndex> vhs(IGAME_CELL_MAX_SIZE, 0);
     std::set<std::pair<igIndex, igIndex>> seen;  // 去重：无向边用 (小, 大) 作为键
 
     // 每条边的"来源单元"编号。遍历按单元 ID 递增，且已出现过的边不再记录，
@@ -254,12 +260,13 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
     };
 
     for (IGsize cid = 0; cid < numCells; ++cid) {
-        const int vcnt = cells->GetCellIds(cid, vhs);
+        const IGuint needed = cells->GetCellSize(cid);
+        if (vhs.size() < needed) { vhs.resize(needed); }
+        const int vcnt = cells->GetCellIds(cid, vhs.data());
         const IGenum cellType = types->GetValue(cid);
 
-        // 少于 2 个点的单元（点单元、空单元）本来就没有边
+        // 少于 2 个点的单元本来就没有边（正常无贡献，不算"跳过"）
         if (vcnt < 2) {
-            RecordSkippedCell(cellType);
             continue;
         }
 
@@ -275,8 +282,8 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
             continue;
         }
 
+        // 点单元 / 空单元本来就没有边，同样不算"跳过"
         if (cellType == IG_VERTEX || cellType == IG_EMPTY_CELL) {
-            RecordSkippedCell(cellType);
             continue;
         }
 
@@ -322,7 +329,12 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
         bool extracted = false;
         for (int e = 0; e < nEdges; ++e) {
             Cell* edge = cell->GetEdge(e);
-            if (edge == nullptr || edge->GetCellSize() != 2) { continue; }
+            if (edge == nullptr) { continue; }
+            const int edgePointCount = edge->GetCellSize();
+            if (edgePointCount < 2) { continue; }
+            // 普通单元的边是 2 个端点；二次单元的边（QuadraticFace::GetEdge）返回的是
+            // 含中点的"二次边"（3 个点）。这里取前两个端点，与 ParaView 提线性边的语义一致，
+            // 绝不能因为"点数不是 2"就把整条边丢掉。
             addEdge(edge->GetPointId(0), edge->GetPointId(1), cid);
             extracted = true;
         }

@@ -12,6 +12,7 @@
 #include <exception>
 #include <set>
 #include <string>
+#include <vector>
 
 IGAME_NAMESPACE_BEGIN
 
@@ -54,6 +55,18 @@ ArrayObject::Pointer CopyAttribute(ArrayObject::Pointer source) {
         COPY_ATTRIBUTE(UnsignedLongLongArray)
 #undef COPY_ATTRIBUTE
         default: break;
+    }
+    if (copy == nullptr) {
+        // 未识别的数组类型：兜底转成 double 保留数据，绝不静默丢弃属性
+        const int dim = source->GetDimension();
+        if (dim <= 0) { return nullptr; }
+        auto fallback = DoubleArray::New();
+        fallback->SetName(source->GetName());
+        fallback->SetDimension(dim);
+        const IGsize values = source->GetNumberOfValues();
+        fallback->Resize(values);
+        for (IGsize i = 0; i < values; ++i) { fallback->SetValue(i, source->GetValue(i)); }
+        copy = fallback;
     }
     return copy;
 }
@@ -123,8 +136,11 @@ UnsignedIntArray::Pointer BuildCellTypesFromPointCount(CellArray::Pointer cells,
  */
 IGsize CountVerticesOfCell(CellArray::Pointer cells, IGsize cellId, IGenum cellType) {
     if (cells == nullptr) { return 0; }
-    igIndex ids[IGAME_CELL_MAX_SIZE] = {0};
-    const int size = cells->GetCellIds(cellId, ids);
+    // 动态缓冲：多面体展开连接表可能超 IGAME_CELL_MAX_SIZE(256)，
+    // 而 CellArray::GetCellIds 不做边界检查，固定数组会越界写内存。
+    const IGuint needed = cells->GetCellSize(cellId);
+    std::vector<igIndex> ids(needed > 0 ? static_cast<size_t>(needed) : 1, 0);
+    const int size = cells->GetCellIds(cellId, ids.data());
     if (size <= 0) { return 0; }
     if (cellType != IG_POLYHEDRON) {
         return static_cast<IGsize>(size);
