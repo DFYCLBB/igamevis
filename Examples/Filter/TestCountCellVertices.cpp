@@ -1,6 +1,7 @@
 #include <CountCellVertices/iGameCountCellVerticesFilter.h>
 
 #include <Core/iGameScene.h>
+#include <cstdlib>
 #include <filesystem>
 #include <iGameAttributeSet.h>
 #include <iGameDrawObject.h>
@@ -192,6 +193,8 @@ void TestEmptyMesh() {
 
 /// 可视化演示：读混合单元模型，按 cell_vertex_count 着色并弹出渲染窗口（便于录屏对照）
 void VisualizeCountResult() {
+    // 设了 IGV_TEST_NO_VIEW 时跳过弹窗，便于自动化/无头环境只跑断言
+    if (std::getenv("IGV_TEST_NO_VIEW") != nullptr) { return; }
     auto mesh = LoadMesh("./Models/CountCellVertices_mixed_cells.vtk");
     if (mesh == nullptr) { return; }
 

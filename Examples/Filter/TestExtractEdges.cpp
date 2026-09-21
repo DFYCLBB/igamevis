@@ -1,6 +1,7 @@
 #include <ExtractEdges/iGameExtractEdgesFilter.h>
 
 #include <Core/iGameScene.h>
+#include <cstdlib>
 #include <filesystem>
 #include <iGameAttributeSet.h>
 #include <iGameDrawObject.h>
@@ -214,8 +215,71 @@ void TestEmptyMesh() {
     }
 }
 
+/// 场景 4：复测示例 —— 输入的单元数据必须按"来源单元"重映射到输出的每条边
+///   两个共享一个面的四面体：输出 9 条边；共享边继承来源单元 ID 较小者（Cell0）的数据，
+///   因此 CellValue 应为 6 个 10 + 3 个 20，OriginalCellTag 应为 6 个 100 + 3 个 200。
+void TestCellDataRemap() {
+    std::cerr << "[case 4] cell data remapped by source cell (9 edges: 6x10 + 3x20)\n";
+    auto mesh = LoadMesh("./Models/extract_edges_cell_data_mismatch.vtu");
+    if (mesh == nullptr) { return; }
+
+    Check(mesh->GetNumberOfPoints() == 5 && mesh->GetNumberOfCells() == 2,
+          "input: 5 points / 2 tetrahedra sharing one face");
+
+    auto filter = iGame::ExtractEdgesFilter::New();
+    filter->SetInput(mesh);
+    Check(filter->Execute(), "Execute() returns true");
+
+    auto out = iGame::DynamicCast<iGame::UnstructuredMesh>(filter->GetOutput());
+    Check(out != nullptr, "GetOutput() is an UnstructuredMesh");
+    if (out == nullptr) { return; }
+
+    const IGsize edgeNum = CheckAllEdges(out);
+    Check(edgeNum == 9, "unique edge count == 9 (got " + std::to_string(edgeNum) + ")");
+
+    // 单元数据不能丢：长度必须等于边数，值按来源单元重映射
+    auto cellValue = FindArray(out, "CellValue", IG_CELL);
+    Check(cellValue != nullptr, "Cell Data 'CellValue' is preserved (not dropped)");
+    if (cellValue != nullptr) {
+        Check(static_cast<IGsize>(cellValue->GetNumberOfValues()) == edgeNum,
+              "CellValue length == edge count (9)");
+        int n10 = 0;
+        int n20 = 0;
+        for (IGsize i = 0; i < edgeNum; ++i) {
+            const int v = static_cast<int>(cellValue->GetValue(i));
+            if (v == 10) { ++n10; } else if (v == 20) { ++n20; }
+        }
+        Check(n10 == 6 && n20 == 3,
+              "CellValue is 6x10 + 3x20 (got " + std::to_string(n10) + "x10 + " +
+                  std::to_string(n20) + "x20)");
+    }
+
+    auto tag = FindArray(out, "OriginalCellTag", IG_CELL);
+    Check(tag != nullptr, "Cell Data 'OriginalCellTag' is preserved (not dropped)");
+    if (tag != nullptr) {
+        Check(static_cast<IGsize>(tag->GetNumberOfValues()) == edgeNum,
+              "OriginalCellTag length == edge count (9)");
+        int n100 = 0;
+        int n200 = 0;
+        for (IGsize i = 0; i < edgeNum; ++i) {
+            const int v = static_cast<int>(tag->GetValue(i));
+            if (v == 100) { ++n100; } else if (v == 200) { ++n200; }
+        }
+        Check(n100 == 6 && n200 == 3,
+              "OriginalCellTag is 6x100 + 3x200 (got " + std::to_string(n100) + "x100 + " +
+                  std::to_string(n200) + "x200)");
+    }
+
+    // 输入模型本身不能被改动
+    auto inCellValue = FindArray(mesh, "CellValue", IG_CELL);
+    Check(inCellValue != nullptr && static_cast<IGsize>(inCellValue->GetNumberOfValues()) == 2,
+          "input mesh keeps its own 2-value CellValue untouched");
+}
+
 /// 可视化演示：读六面体网格，提取边并以线框形式弹出渲染窗口（便于录屏对照）
 void VisualizeEdgesResult() {
+    // 设了 IGV_TEST_NO_VIEW 时跳过弹窗，便于自动化/无头环境只跑断言
+    if (std::getenv("IGV_TEST_NO_VIEW") != nullptr) { return; }
     auto mesh = LoadMesh("./Models/ExtractEdges_hexa_grid.vtk");
     if (mesh == nullptr) { return; }
 
@@ -249,6 +313,7 @@ int main() {
     TestTriMeshWithCellData();
     TestHexaGrid();
     TestEmptyMesh();
+    TestCellDataRemap();
 
     if (g_failed == 0) {
         std::cerr << "[testExtractEdges] PASS: all checks passed\n";

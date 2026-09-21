@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 IGAME_NAMESPACE_BEGIN
 
@@ -42,6 +43,58 @@ void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
     if (attrs == nullptr) { return; }
     const int index = attrs->GetAttributeIndex(name);
     if (index >= 0) { attrs->DeleteAttribute(index); }
+}
+
+/// 按实际类型创建一个同类型的空数组（用于按来源单元重映射 Cell Data）
+ArrayObject::Pointer NewArrayLike(ArrayObject::Pointer src) {
+    if (src == nullptr) { return nullptr; }
+    switch (src->GetArrayType()) {
+#define NEW_ARRAY_LIKE(Type) case IG_##Type: return Type::New();
+        NEW_ARRAY_LIKE(FloatArray)
+        NEW_ARRAY_LIKE(DoubleArray)
+        NEW_ARRAY_LIKE(IntArray)
+        NEW_ARRAY_LIKE(UnsignedIntArray)
+        NEW_ARRAY_LIKE(CharArray)
+        NEW_ARRAY_LIKE(UnsignedCharArray)
+        NEW_ARRAY_LIKE(ShortArray)
+        NEW_ARRAY_LIKE(UnsignedShortArray)
+        NEW_ARRAY_LIKE(LongLongArray)
+        NEW_ARRAY_LIKE(UnsignedLongLongArray)
+#undef NEW_ARRAY_LIKE
+        default: return nullptr;
+    }
+}
+
+/**
+ * 把输入的"单元数据"按每条边的来源单元重映射到输出：
+ *   输出第 i 条边的值 = 输入第 sourceCells[i] 个单元的对应值。
+ *
+ * 为什么不能原样沿用：输入单元数是 N、输出是边数 M，长度对不上，
+ * 直接搬会造成属性与单元错位（复测反馈的 cell data mismatch）。
+ * 为什么不是丢弃：输出的每条边都来自某个输入单元，理应继承它的单元数据，
+ * 否则 CellValue/OriginalCellTag 这类信息在提取后就彻底丢失了。
+ * 共享边在提取时只记录"来源单元 ID 较小"的那一个，因此它的数据取自 ID 较小的单元。
+ */
+ArrayObject::Pointer RemapCellArrayBySource(ArrayObject::Pointer src,
+                                            const std::vector<IGuint>& sourceCells) {
+    if (src == nullptr) { return nullptr; }
+    auto out = NewArrayLike(src);
+    if (out == nullptr) { return nullptr; }
+    const int dim = src->GetDimension();
+    if (dim <= 0) { return nullptr; }
+    out->SetName(src->GetName());
+    out->SetDimension(dim);
+
+    const IGsize n = static_cast<IGsize>(sourceCells.size());
+    const IGsize d = static_cast<IGsize>(dim);
+    out->Resize(n * d);
+    for (IGsize i = 0; i < n; ++i) {
+        const IGsize s = static_cast<IGsize>(sourceCells[i]);
+        for (IGsize k = 0; k < d; ++k) {
+            out->SetValue(i * d + k, src->GetValue(s * d + k));
+        }
+    }
+    return out;
 }
 
 }  // namespace
@@ -144,12 +197,15 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
 
     auto edges = CellArray::New();          // 边的连接表（每条边 2 个点）
     auto edgeTypes = UnsignedIntArray::New();  // 每条边的类型：IG_LINE
-    auto edgeSource = UnsignedIntArray::New();  // 每条边的来源单元编号（Cell Data）
-    edgeSource->SetName(kSourceCellArrayName);
 
     const IGsize numCells = cells->GetNumberOfCells();
     igIndex vhs[IGAME_CELL_MAX_SIZE] = {0};
     std::set<std::pair<igIndex, igIndex>> seen;  // 去重：无向边用 (小, 大) 作为键
+
+    // 每条边的"来源单元"编号。遍历按单元 ID 递增，且已出现过的边不再记录，
+    // 所以共享边留下来的必然是"来源单元 ID 较小"的那一个（与复测要求一致）。
+    std::vector<IGuint> sourceCells;
+    sourceCells.reserve(numCells * 3);
 
     edges->Reserve(numCells * 3);
 
@@ -159,7 +215,7 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
         if (!seen.insert(key).second) { return; }
         edges->AddCellId2(a, b);
         edgeTypes->AddValue(IG_LINE);
-        edgeSource->AddValue(static_cast<IGuint>(sourceCell));
+        sourceCells.push_back(static_cast<IGuint>(sourceCell));
     };
 
     for (IGsize cid = 0; cid < numCells; ++cid) {
@@ -219,9 +275,32 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
 
     output->SetCells(edges, edgeTypes);
 
-    // Cell Data 按输出边数重建（长度 = 边数），并先清掉同名旧数组
+    // —— Cell Data 按输出边数重建（长度 = 边数）——
     auto outAttrs = output->GetAttributeSet();
     if (outAttrs != nullptr) {
+        // 1) 输入原有的单元数据按"每条边的来源单元"逐值重映射到输出：
+        //    长度与边数一致，语义也正确（共享边继承来源单元 ID 较小的那份数据）。
+        if (auto inAttrs = input->GetAttributeSet(); inAttrs != nullptr) {
+            auto all = inAttrs->GetAllAttributes();
+            if (all != nullptr) {
+                for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
+                    auto& attr = all->GetElement(i);
+                    if (attr.isDeleted || attr.pointer == nullptr) { continue; }
+                    if (attr.attachmentType != IG_CELL) { continue; }
+                    if (std::string(attr.pointer->GetName()) == kSourceCellArrayName) { continue; }
+                    auto remapped = RemapCellArrayBySource(attr.pointer, sourceCells);
+                    if (remapped == nullptr) { continue; }
+                    RemoveArrayIfExists(outAttrs, remapped->GetName());
+                    outAttrs->AddAttribute(attr.type, IG_CELL, remapped);
+                }
+            }
+        }
+
+        // 2) 每条边的来源单元编号（辅助 Cell Data，便于追溯边是从哪个单元提取的）
+        auto edgeSource = UnsignedIntArray::New();
+        edgeSource->SetName(kSourceCellArrayName);
+        edgeSource->Reserve(sourceCells.size());
+        for (IGuint sc : sourceCells) { edgeSource->AddValue(sc); }
         RemoveArrayIfExists(outAttrs, kSourceCellArrayName);
         outAttrs->AddScalar(IG_CELL, edgeSource);
     }
