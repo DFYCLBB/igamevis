@@ -18,8 +18,11 @@ IGAME_NAMESPACE_BEGIN
 
 namespace {
 
-/// 输出网格的 Cell Data：每条边的来源单元编号
-constexpr const char* kSourceCellArrayName = "edge_source_cell";
+/// 输出 Cell Data：每条边的 VTK 单元类型编号（数组名，便于在属性面板里查看）
+constexpr const char* kCellTypeArrayName = "CellType";
+
+/// VTK 的 vtkLine 编号。注意：iGame 内部枚举是 IG_LINE = 2，VTK 是 3，两套体系不能混用。
+constexpr unsigned char kVtkLine = 3;
 
 /// 按实际类型创建一个同类型的空数组（点数据深拷贝 / 单元数据重映射共用）
 ArrayObject::Pointer NewArrayLike(ArrayObject::Pointer src) {
@@ -56,7 +59,10 @@ ArrayObject::Pointer DeepCopyArray(ArrayObject::Pointer src) {
     dst->SetName(src->GetName());
     dst->SetDimension(dim);
     const IGsize values = src->GetNumberOfValues();
-    dst->Resize(values);
+    // 注意：FlatArray::Resize 的参数是"元素个数"，框架内部会再乘一次维度
+    // （resize(_NewElementNum * m_Dimension)）。这里必须传元素数，
+    // 传标量数会让多分量数组的长度被放大 dim 倍。
+    dst->Resize(src->GetNumberOfElements());
     for (IGsize i = 0; i < values; ++i) {
         dst->SetValue(i, src->GetValue(i));
     }
@@ -92,11 +98,28 @@ void DeepCopyPointAttributes(AttributeSet::Pointer src, AttributeSet::Pointer ds
     }
 }
 
-/// 写结果前先删掉同名数组，保证重复执行不会堆积同名数组
-void RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name) {
-    if (attrs == nullptr) { return; }
-    const int index = attrs->GetAttributeIndex(name);
-    if (index >= 0) { attrs->DeleteAttribute(index); }
+/**
+ * 写结果前先删掉同名数组，保证重复执行不会堆积同名数组。
+ *
+ * 必须同时匹配"挂载类型"：AttributeSet::GetAttributeIndex 只按名字匹配、
+ * 忽略 IG_POINT / IG_CELL，而 VTK 允许点数据与单元数据同名（如都叫 "Normals"）。
+ * 如果只按名字删，就会把合法的同名点数据误删。
+ */
+bool RemoveArrayIfExists(AttributeSet::Pointer attrs, const std::string& name,
+                         IGenum attachmentType) {
+    if (attrs == nullptr) { return false; }
+    auto all = attrs->GetAllAttributes();
+    if (all == nullptr) { return false; }
+    for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
+        auto& attr = all->GetElement(i);
+        if (attr.isDeleted || attr.pointer == nullptr) { continue; }
+        if (attr.attachmentType != attachmentType) { continue; }
+        if (std::string(attr.pointer->GetName()) == name) {
+            attrs->DeleteAttribute(i);
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -123,7 +146,9 @@ ArrayObject::Pointer RemapCellArrayBySource(ArrayObject::Pointer src,
 
     const IGsize n = static_cast<IGsize>(sourceCells.size());
     const IGsize d = static_cast<IGsize>(dim);
-    out->Resize(n * d);
+    // Resize 收"元素个数"（内部再乘 dim），这里传 n 而不是 n*d，
+    // 否则多分量单元数据（向量/张量）的长度会被放大 dim 倍。
+    out->Resize(n);
     for (IGsize i = 0; i < n; ++i) {
         const IGsize s = static_cast<IGsize>(sourceCells[i]);
         for (IGsize k = 0; k < d; ++k) {
@@ -348,10 +373,27 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
     output->SetCells(edges, edgeTypes);
 
     // —— Cell Data 按输出边数重建（长度 = 边数）——
+    // 注意：属性面板 / 导出文件里数组的排列顺序 = 这里向属性集添加的顺序，
+    // 所以 CellType 先加，让它排在 Cell Data 的第一位（紧跟单元编号列）。
     auto outAttrs = output->GetAttributeSet();
     if (outAttrs != nullptr) {
-        // 1) 输入原有的单元数据按"每条边的来源单元"逐值重映射到输出：
-        //    长度与边数一致，语义也正确（共享边继承来源单元 ID 较小的那份数据）。
+        // 1) CellType：每条输出单元的"VTK 单元类型编号"（Cell Data，长度 = 边数）。
+        //    提取结果全部是 1 维线单元，即 VTK 的 vtkLine = 3。
+        //    与 ParaView 中给数据集加 "Cell Types" 数组的做法同义（值取自 GetCellTypesArray()），
+        //    便于直接以数组形式查看/筛选每条边的单元类型。
+        //    注意：写的是 VTK 编号（3），不是 iGame 内部的 IG_LINE(2) —— 两套体系不能混。
+        auto cellTypes = UnsignedCharArray::New();
+        cellTypes->SetName(kCellTypeArrayName);
+        cellTypes->SetDimension(1);
+        cellTypes->Reserve(output->GetNumberOfCells());
+        for (IGsize i = 0; i < output->GetNumberOfCells(); ++i) {
+            cellTypes->AddValue(kVtkLine);
+        }
+        RemoveArrayIfExists(outAttrs, kCellTypeArrayName, IG_CELL);
+        outAttrs->AddScalar(IG_CELL, cellTypes);
+
+        // 2) 输入原有的单元数据按"每条边的来源单元"逐值重映射到输出
+        //    （不额外生成"边→来源单元"的映射数组，与 vtkExtractEdges 一致）。
         if (auto inAttrs = input->GetAttributeSet(); inAttrs != nullptr) {
             auto all = inAttrs->GetAllAttributes();
             if (all != nullptr) {
@@ -359,22 +401,13 @@ bool ExtractEdgesFilter::ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
                     auto& attr = all->GetElement(i);
                     if (attr.isDeleted || attr.pointer == nullptr) { continue; }
                     if (attr.attachmentType != IG_CELL) { continue; }
-                    if (std::string(attr.pointer->GetName()) == kSourceCellArrayName) { continue; }
                     auto remapped = RemapCellArrayBySource(attr.pointer, sourceCells);
                     if (remapped == nullptr) { continue; }
-                    RemoveArrayIfExists(outAttrs, remapped->GetName());
+                    RemoveArrayIfExists(outAttrs, remapped->GetName(), IG_CELL);
                     outAttrs->AddAttribute(attr.type, IG_CELL, remapped);
                 }
             }
         }
-
-        // 2) 每条边的来源单元编号（辅助 Cell Data，便于追溯边是从哪个单元提取的）
-        auto edgeSource = UnsignedIntArray::New();
-        edgeSource->SetName(kSourceCellArrayName);
-        edgeSource->Reserve(sourceCells.size());
-        for (IGuint sc : sourceCells) { edgeSource->AddValue(sc); }
-        RemoveArrayIfExists(outAttrs, kSourceCellArrayName);
-        outAttrs->AddScalar(IG_CELL, edgeSource);
     }
     return true;
 }

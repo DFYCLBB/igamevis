@@ -80,8 +80,10 @@ std::vector<std::string> CollectBadCellArrays(iGame::DataObject::Pointer obj, IG
     for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
         auto& attr = all->GetElement(i);
         if (attr.isDeleted || attr.pointer == nullptr) { continue; }
+        // 注意用 GetNumberOfElements（元组数）而不是 GetNumberOfValues（标量数）：
+        // 多分量数组的标量数是 元组数×分量数，用标量数比较会把合法数组误判为长度错误。
         if (attr.attachmentType != IG_CELL) { continue; }
-        if (static_cast<IGsize>(attr.pointer->GetNumberOfValues()) != cellNum) {
+        if (static_cast<IGsize>(attr.pointer->GetNumberOfElements()) != cellNum) {
             bad.emplace_back(attr.pointer->GetName());
         }
     }
@@ -152,11 +154,36 @@ void TestTriMeshWithCellData() {
     for (const auto& name : bad) { badNames += name + " "; }
     Check(bad.empty(), "every Cell Data array length == edge count (bad: " + badNames + ")");
 
-    auto sourceCell = FindArray(out, "edge_source_cell", IG_CELL);
-    Check(sourceCell != nullptr, "Cell Data 'edge_source_cell' is generated");
-    if (sourceCell != nullptr) {
-        Check(static_cast<IGsize>(sourceCell->GetNumberOfValues()) == edgeNum,
-              "edge_source_cell length == edge count");
+    // 不生成"边→来源单元"的映射数组（与 vtkExtractEdges 一致）
+    Check(FindArray(out, "edge_source_cell", IG_CELL) == nullptr,
+          "no auxiliary 'edge_source_cell' array is added (matches ParaView output)");
+
+    // CellType：每条边的 VTK 单元类型编号（vtkLine = 3），长度 = 边数
+    auto cellType = FindArray(out, "CellType", IG_CELL);
+    Check(cellType != nullptr, "Cell Data 'CellType' is generated");
+    if (cellType != nullptr) {
+        Check(static_cast<IGsize>(cellType->GetNumberOfElements()) == edgeNum,
+              "CellType tuple count == edge count");
+        bool allLine = true;
+        for (IGsize i = 0; i < edgeNum; ++i) {
+            if (static_cast<int>(cellType->GetElementValue(i, 0)) != 3) { allLine = false; break; }
+        }
+        Check(allLine, "CellType value == 3 (vtkLine) for every edge");
+    }
+
+    // CellType 排在 Cell Data 的第一位（属性面板 / 导出文件里的数组顺序 = 添加顺序）
+    {
+        auto all = out->GetAttributeSet()->GetAllAttributes();
+        std::string firstCellName;
+        for (int i = 0; i < static_cast<int>(all->GetNumberOfElements()); ++i) {
+            auto& a = all->GetElement(i);
+            if (a.isDeleted || a.pointer == nullptr) { continue; }
+            if (a.attachmentType != IG_CELL) { continue; }
+            firstCellName = a.pointer->GetName();
+            break;
+        }
+        Check(firstCellName == "CellType",
+              "CellType is the first Cell Data array (got '" + firstCellName + "')");
     }
 
     // 输入模型的属性不能被改动（独立输出节点）
@@ -276,6 +303,115 @@ void TestCellDataRemap() {
           "input mesh keeps its own 2-value CellValue untouched");
 }
 
+/// 场景 5：多分量数组 + 点/单元同名数组（通用性回归）
+///   同一个几何（2 个共享面的四面体，9 条边），但数据里同时有：
+///     - 多分量：p_vec(点,3分量)、c_vec(单元,3分量)
+///     - 同名：shared_tag 同时存在于 Point Data 与 Cell Data
+///   期望：多分量数组"元组数"等于对应单元/点数（不能被放大成分量数倍），
+///         同名点数组不能被单元数据的同名处理误删。
+void TestMultiComponentData() {
+    std::cerr << "[case 5] multi-component + same-name arrays stay correct\n";
+    auto mesh = LoadMesh("./Models/ExtractEdges_multicomp_cell_data.vtk");
+    if (mesh == nullptr) { return; }
+
+    Check(mesh->GetNumberOfPoints() == 5 && mesh->GetNumberOfCells() == 2,
+          "input: 5 points / 2 tetrahedra sharing one face");
+
+    auto filter = iGame::ExtractEdgesFilter::New();
+    filter->SetInput(mesh);
+    Check(filter->Execute(), "Execute() returns true");
+
+    auto out = iGame::DynamicCast<iGame::UnstructuredMesh>(filter->GetOutput());
+    Check(out != nullptr, "GetOutput() is an UnstructuredMesh");
+    if (out == nullptr) { return; }
+
+    const IGsize edgeNum = CheckAllEdges(out);
+    Check(edgeNum == 9, "unique edge count == 9 (got " + std::to_string(edgeNum) + ")");
+    const IGsize pointNum = mesh->GetNumberOfPoints();
+
+    // —— 多分量单元数据：元组数必须等于边数，值按来源单元重映射 ——
+    auto cVec = FindArray(out, "c_vec", IG_CELL);
+    Check(cVec != nullptr, "Cell Data 'c_vec' (3 components) is preserved");
+    if (cVec != nullptr) {
+        Check(cVec->GetDimension() == 3, "c_vec keeps 3 components");
+        Check(static_cast<IGsize>(cVec->GetNumberOfElements()) == edgeNum,
+              "c_vec tuple count == edge count (9), not 9*components (got " +
+                  std::to_string(cVec->GetNumberOfElements()) + ")");
+        int fromCell0 = 0, fromCell1 = 0;
+        for (IGsize i = 0; i < edgeNum; ++i) {
+            const double x = cVec->GetElementValue(i, 0);
+            const double y = cVec->GetElementValue(i, 1);
+            const double z = cVec->GetElementValue(i, 2);
+            if (x == 10 && y == 11 && z == 12) { ++fromCell0; }
+            if (x == 20 && y == 21 && z == 22) { ++fromCell1; }
+        }
+        Check(fromCell0 == 6 && fromCell1 == 3,
+              "c_vec is 6x(10,11,12) + 3x(20,21,22) (got " + std::to_string(fromCell0) +
+                  " + " + std::to_string(fromCell1) + ")");
+    }
+
+    auto cScalar = FindArray(out, "c_scalar", IG_CELL);
+    if (cScalar != nullptr) {
+        Check(static_cast<IGsize>(cScalar->GetNumberOfElements()) == edgeNum,
+              "c_scalar tuple count == edge count (9)");
+    } else {
+        Check(false, "Cell Data 'c_scalar' is preserved");
+    }
+
+    // —— 点数据：元组数必须仍等于点数（多分量不能被放大）——
+    auto pVec = FindArray(out, "p_vec", IG_POINT);
+    Check(pVec != nullptr, "Point Data 'p_vec' (3 components) is preserved");
+    if (pVec != nullptr) {
+        Check(pVec->GetDimension() == 3, "p_vec keeps 3 components");
+        Check(static_cast<IGsize>(pVec->GetNumberOfElements()) == pointNum,
+              "p_vec tuple count == point count (5), not 5*components (got " +
+                  std::to_string(pVec->GetNumberOfElements()) + ")");
+        Check(pVec->GetElementValue(4, 0) == 1.0 && pVec->GetElementValue(4, 1) == 1.0 &&
+                  pVec->GetElementValue(4, 2) == 1.0,
+              "p_vec values preserved");
+    }
+
+    auto pScalar = FindArray(out, "p_scalar", IG_POINT);
+    if (pScalar != nullptr) {
+        Check(static_cast<IGsize>(pScalar->GetNumberOfElements()) == pointNum,
+              "p_scalar tuple count == point count (5)");
+    } else {
+        Check(false, "Point Data 'p_scalar' is preserved");
+    }
+
+    // —— 同名数组：点上的 shared_tag 不能被单元上的同名处理误删 ——
+    auto pointTag = FindArray(out, "shared_tag", IG_POINT);
+    Check(pointTag != nullptr, "Point Data 'shared_tag' survives the cell-data remap");
+    if (pointTag != nullptr) {
+        Check(static_cast<IGsize>(pointTag->GetNumberOfElements()) == pointNum,
+              "point 'shared_tag' tuple count == point count (5)");
+        Check(pointTag->GetElementValue(4, 0) == 104.0, "point 'shared_tag' values preserved");
+    }
+    auto cellTag = FindArray(out, "shared_tag", IG_CELL);
+    Check(cellTag != nullptr, "Cell Data 'shared_tag' is remapped to the edges");
+    if (cellTag != nullptr) {
+        Check(static_cast<IGsize>(cellTag->GetNumberOfElements()) == edgeNum,
+              "cell 'shared_tag' tuple count == edge count (9)");
+        int n1000 = 0, n2000 = 0;
+        for (IGsize i = 0; i < edgeNum; ++i) {
+            const int v = static_cast<int>(cellTag->GetElementValue(i, 0));
+            if (v == 1000) { ++n1000; } else if (v == 2000) { ++n2000; }
+        }
+        Check(n1000 == 6 && n2000 == 3,
+              "cell 'shared_tag' is 6x1000 + 3x2000 (got " + std::to_string(n1000) +
+                  " + " + std::to_string(n2000) + ")");
+    }
+
+    // 输入模型不能被改动
+    auto inCVec = FindArray(mesh, "c_vec", IG_CELL);
+    Check(inCVec != nullptr && static_cast<IGsize>(inCVec->GetNumberOfElements()) == 2,
+          "input mesh keeps its own 2-tuple c_vec untouched");
+    auto inPointTag = FindArray(mesh, "shared_tag", IG_POINT);
+    Check(inPointTag != nullptr &&
+              static_cast<IGsize>(inPointTag->GetNumberOfElements()) == pointNum,
+          "input mesh keeps its own point 'shared_tag' untouched");
+}
+
 /// 可视化演示：读六面体网格，提取边并以线框形式弹出渲染窗口（便于录屏对照）
 void VisualizeEdgesResult() {
     // 设了 IGV_TEST_NO_VIEW 时跳过弹窗，便于自动化/无头环境只跑断言
@@ -314,6 +450,7 @@ int main() {
     TestHexaGrid();
     TestEmptyMesh();
     TestCellDataRemap();
+    TestMultiComponentData();
 
     if (g_failed == 0) {
         std::cerr << "[testExtractEdges] PASS: all checks passed\n";

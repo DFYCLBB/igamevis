@@ -5137,11 +5137,6 @@ void igQtMainWindow::initAllFilters() {
         });
     });
 
-    // ===== 任务入口：加入「算法处理」一级菜单 =====
-    // 简单任务 #5（统计单元顶点数）+ 中等任务 #28（边提取）
-    // 与"数据处理/数据转换/特征提取"子菜单并列，作为一级菜单项追加在末尾
-    ui->menu_filters->addAction(ui->action_ExtractEdges);
-    ui->menu_filters->addAction(ui->action_CountCellVertices);
     // ===== AppendReduce: 网格合并去重 =====
     QAction* appendReduceAction = ui->menu_filters->addAction(QStringLiteral("网格合并去重 (Append/Reduce)"));
     connect(appendReduceAction, &QAction::triggered, this, [&](bool checked) {
@@ -6128,26 +6123,29 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
         if (!dataObject) return;
         ui->widget_ContourExtract->SetOriginDataObject(dataObject);
     });
-    connect(ui->action_ExtractEdges, &QAction::triggered, this, [this](bool) {
-        openLeftToolPanel(LeftToolPanelId::ExtractEdges);
-        auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
-        if (!scene) return;
-        auto CurrentModel = scene->GetCurrentModel();
-        if (!CurrentModel) return;
-        auto dataObject = CurrentModel->GetDataObject();
-        if (!dataObject) return;
-        ui->widget_ExtractEdges->SetOriginDataObject(dataObject);
-    });
-    connect(ui->action_CountCellVertices, &QAction::triggered, this, [this](bool) {
-        openLeftToolPanel(LeftToolPanelId::CountCellVertices);
-        auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
-        if (!scene) return;
-        auto CurrentModel = scene->GetCurrentModel();
-        if (!CurrentModel) return;
-        auto dataObject = CurrentModel->GetDataObject();
-        if (!dataObject) return;
-        ui->widget_CountCellVertices->SetOriginDataObject(dataObject);
-    });
+    /* 边提取与统计单元顶点数是「算法处理」下的一级菜单项。 */
+    connect(ui->menu_filters->addAction(QStringLiteral("边提取 (ExtractEdges)")), &QAction::triggered, this,
+            [this](bool) {
+                openLeftToolPanel(LeftToolPanelId::ExtractEdges);
+                auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
+                if (!scene) return;
+                auto CurrentModel = scene->GetCurrentModel();
+                if (!CurrentModel) return;
+                auto dataObject = CurrentModel->GetDataObject();
+                if (!dataObject) return;
+                ui->widget_ExtractEdges->SetOriginDataObject(dataObject);
+            });
+    connect(ui->menu_filters->addAction(QStringLiteral("统计单元顶点数 (CountCellVertices)")), &QAction::triggered,
+            this, [this](bool) {
+                openLeftToolPanel(LeftToolPanelId::CountCellVertices);
+                auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
+                if (!scene) return;
+                auto CurrentModel = scene->GetCurrentModel();
+                if (!CurrentModel) return;
+                auto dataObject = CurrentModel->GetDataObject();
+                if (!dataObject) return;
+                ui->widget_CountCellVertices->SetOriginDataObject(dataObject);
+            });
     connect(ui->action_MergeVectorComponents, &QAction::triggered, this, [this](bool) {
         openLeftToolPanel(LeftToolPanelId::MergeVectorComponents);
         auto scene = iGame::SceneManager::Instance()->GetCurrentScene();

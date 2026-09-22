@@ -16,11 +16,18 @@ IGAME_NAMESPACE_BEGIN
  * @brief 提取网格的全部唯一边（去重），输出一个只含 IG_LINE 单元的独立 UnstructuredMesh。
  *
  * 【输出约定：独立结果节点】
- *   - 点坐标与输入只读共享；每个输出单元都是 2 点线段（IG_LINE）；
- *   - Point Data 按引用保留（点数不变，语义仍然成立）；
- *   - Cell Data **不沿用输入**（输入单元数是 N、输出是边数 M，长度对不上），
- *     改为生成 edge_source_cell —— 每条边记录它来自哪个输入单元（共享边取首次遇到的那个），
- *     保证输出属性长度与边数一致。
+ *   - 点坐标（深拷贝）与单元连接表都是独立的，不共享输入内存；
+ *     每个输出单元都是 2 点线段（IG_LINE）；
+ *   - Point Data 深拷贝保留（点数不变，语义仍然成立）；
+ *   - Cell Data **按"每条边的来源单元"重映射**（输入单元数 N ≠ 输出边数 M，
+ *     不能原样沿用、也不能丢弃）：输出第 i 条边取它来源单元的对应值，
+ *     共享边取来源单元 ID 较小者（与 vtkExtractEdges 的 minimum cell id 规则一致），
+ *     从而保证输出属性长度与边数一致。
+ *     不额外生成"边→来源单元"的辅助数组。
+ *   - 另外固定生成一个 `CellType` 数组（Cell Data，长度 = 边数）：每条边的 **VTK 单元类型编号**，
+ *     提取结果全是 1 维线单元，故值恒为 `vtkLine = 3`（注意不是 iGame 内部的 IG_LINE = 2）。
+ *     语义与 ParaView 中给数据集添加 "Cell Types" 数组（取自 GetCellTypesArray()）一致，
+ *     便于在属性面板里以数组形式查看/筛选每条边的单元类型。
  *   - 输入中已有的 IG_LINE 会被保留，IG_POLY_LINE 会逐段拆成多条线段。
  *
  * 【失败与空结果的区分】
@@ -60,7 +67,7 @@ protected:
 
     bool ExecuteWithPointSet(DataObject::Pointer input);
 
-    /// 从 input 提取边并填充 output（含 edge_source_cell），返回是否成功
+    /// 从 input 提取边并填充 output（含按来源单元重映射的 Cell Data），返回是否成功
     bool ExtractEdgesFromMesh(UnstructuredMesh::Pointer input,
                               UnstructuredMesh::Pointer output);
 

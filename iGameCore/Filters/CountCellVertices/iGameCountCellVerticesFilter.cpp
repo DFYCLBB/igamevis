@@ -64,7 +64,9 @@ ArrayObject::Pointer CopyAttribute(ArrayObject::Pointer source) {
         fallback->SetName(source->GetName());
         fallback->SetDimension(dim);
         const IGsize values = source->GetNumberOfValues();
-        fallback->Resize(values);
+        // FlatArray::Resize 收"元素个数"（内部再乘维度），必须传元素数，
+        // 传标量数会让多分量数组长度被放大 dim 倍。
+        fallback->Resize(source->GetNumberOfElements());
         for (IGsize i = 0; i < values; ++i) { fallback->SetValue(i, source->GetValue(i)); }
         copy = fallback;
     }

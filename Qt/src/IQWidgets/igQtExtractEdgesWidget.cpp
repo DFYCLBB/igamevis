@@ -116,7 +116,7 @@ void igQtExtractEdgesWidget::ExtractEdges() {
         if (out != nullptr && out->GetNumberOfCells() > 0) {
             // 把边网格的点/单元/属性拷贝到结果容器里：
             // SetPoints()：设置点坐标数组；SetCells(conn, types)：设置单元连接+类型；
-            // SetAttributeSet()：设置属性集（Point Data 保留 + edge_source_cell）
+            // SetAttributeSet()：设置属性集（Point Data 深拷贝保留 + Cell Data 按来源单元重映射）
             m_ResultMesh->SetPoints(out->GetPoints());
             m_ResultMesh->SetCells(out->GetCells(), out->GetCellTypes());
             m_ResultMesh->SetAttributeSet(out->GetAttributeSet());
